@@ -1,0 +1,14 @@
+{
+  "name": "claude-orchestrator-bridge",
+  "version": "1.0.0",
+  "description": "HTTP bridge connecting voice agents to Claude Code sessions",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}

@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""Claude Code session manager - list, resume, send, read, start, kill sessions.
+
+Works by reading Claude Code's internal session files (~/.claude/sessions/*.json
+for PIDs, ~/.claude/projects/*/SESSION_ID.jsonl for conversation history) and
+using AppleScript keystroke injection for cross-session communication on macOS.
+
+Requirements:
+  - macOS (AppleScript + Terminal.app)
+  - Accessibility permissions for Terminal.app
+  - tmux (for background sessions)
+  - Claude Code CLI in PATH
+"""
+
+import json
+import os
+import sys
+import glob
+import datetime
+import subprocess
+import argparse
+import select
+import time
+
+HOME = os.path.expanduser("~")
+SESSIONS_DIR = os.path.join(HOME, ".claude/sessions")
+PROJECTS_DIR = os.path.join(HOME, ".claude/projects")
+RESULTS_DIR = os.path.join(HOME, ".claude/voice-results")
+
+# Flags applied to all sessions started/resumed by this tool.
+# Edit these to match your preferences.
+DEFAULT_FLAGS = [
+    "--dangerously-skip-permissions",
+    "--chrome",
+    "--channels", "plugin:telegram@claude-plugins-official",
+]
+
+
+def get_active_sessions():
+    """Get currently active sessions from PID files."""
+    active = {}
+    if not os.path.isdir(SESSIONS_DIR):
+        return active
+    for f in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
+        try:
+            with open(f) as fh:
+                data = json.load(fh)
+                sid = data.get("sessionId")
+                pid = data.get("pid")
+                if pid:
+                    try:
+                        os.kill(pid, 0)
+                        active[sid] = data
+                    except ProcessLookupError:
+                        pass
+        except Exception:
+            pass
+    return active
+
+
+def get_first_user_message(jsonl_path):
+    """Extract the first user message as a topic summary."""
+    try:
+        with open(jsonl_path) as fh:
+            for line in fh:
+                try:
+                    data = json.loads(line)
+                    msg = data.get("message", {})
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    return c["text"][:120].replace("\n", " ").strip()
+                        elif isinstance(content, str):
+                            return content[:120].replace("\n", " ").strip()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return ""
+
+
+def get_all_sessions(limit=None, active_only=False):
+    """Get all sessions with metadata."""
+    active = get_active_sessions()
+    sessions = []
+
+    if not os.path.isdir(PROJECTS_DIR):
+        return sessions
+
+    for jsonl in glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")):
+        sid = os.path.basename(jsonl).replace(".jsonl", "")
+        project_dir = os.path.basename(os.path.dirname(jsonl))
+        size = os.path.getsize(jsonl)
+        mtime = os.path.getmtime(jsonl)
+        is_active = sid in active
+
+        if active_only and not is_active:
+            continue
+
+        # Prettify project path: -Users-foo-dev-project → ~/dev/project
+        project = project_dir
+        home_prefix = f"-Users-{os.path.basename(HOME)}-"
+        if project.startswith(home_prefix):
+            project = "~/" + project[len(home_prefix):].replace("-", "/")
+        elif project == f"-Users-{os.path.basename(HOME)}":
+            project = "~"
+        else:
+            project = project.replace("-", "/")
+
+        active_info = active.get(sid, {})
+        topic = get_first_user_message(jsonl)
+
+        sessions.append({
+            "session_id": sid,
+            "project": project,
+            "size_kb": round(size / 1024),
+            "last_modified": datetime.datetime.fromtimestamp(mtime),
+            "active": is_active,
+            "pid": active_info.get("pid"),
+            "cwd": active_info.get("cwd"),
+            "topic": topic or "(no topic)",
+        })
+
+    sessions.sort(key=lambda x: x["last_modified"], reverse=True)
+    if limit:
+        sessions = sessions[:limit]
+    return sessions
+
+
+def cmd_list(args):
+    """List sessions."""
+    sessions = get_all_sessions(limit=args.limit, active_only=args.active)
+
+    if args.json:
+        for s in sessions:
+            s["last_modified"] = s["last_modified"].isoformat()
+        print(json.dumps(sessions, indent=2))
+        return
+
+    active_count = sum(1 for s in sessions if s["active"])
+    total = len(get_all_sessions()) if not args.active else active_count
+    print(f"\n  Claude Code Sessions: {active_count} active / {total} total\n")
+    print(f"  {'STATUS':<10} {'PROJECT':<35} {'MODIFIED':<18} {'SIZE':>7}  TOPIC")
+    print(f"  {'─'*10} {'─'*35} {'─'*18} {'─'*7}  {'─'*50}")
+
+    for s in sessions:
+        status = "\033[32m● ALIVE\033[0m" if s["active"] else "\033[90m○ dead\033[0m"
+        mod = s["last_modified"].strftime("%Y-%m-%d %H:%M")
+        size = f"{s['size_kb']}KB"
+        topic = s["topic"][:50]
+        proj = s["project"][:35]
+        print(f"  {status}  {proj:<35} {mod:<18} {size:>7}  {topic}")
+
+    print(f"\n  Resume: claude-sessions resume <SESSION_ID>")
+    print(f"  Start:  claude-sessions start <NAME> <DIR>\n")
+
+
+def cmd_ids(args):
+    """Show session IDs for easy copy-paste."""
+    sessions = get_all_sessions(active_only=args.active)
+    for s in sessions:
+        status = "ALIVE" if s["active"] else "dead"
+        mod = s["last_modified"].strftime("%m/%d %H:%M")
+        print(f"{s['session_id']}  {status:<5}  {s['project']:<30}  {mod}  {s['topic'][:60]}")
+
+
+def cmd_resume(args):
+    """Resume a session by ID or partial match."""
+    sessions = get_all_sessions()
+    match = find_session(sessions, args.session)
+
+    if match["active"]:
+        print(f"Session is already alive (PID {match['pid']})")
+        print(f"Attach to it in tmux or run: claude --resume {match['session_id']}")
+        sys.exit(0)
+
+    cwd = match.get("cwd") or HOME
+    cmd = ["claude", "--resume", match["session_id"]] + DEFAULT_FLAGS
+
+    if args.background:
+        window_name = match["project"].split("/")[-1] or "claude"
+        tmux_cmd = f"cd {cwd} && {' '.join(cmd)}"
+        subprocess.run(["tmux", "new-window", "-n", window_name, tmux_cmd])
+        print(f"Resumed in tmux window '{window_name}'")
+    else:
+        print(f"Resuming: {match['session_id']}")
+        print(f"Project:  {match['project']}")
+        print(f"Topic:    {match['topic'][:80]}")
+        os.chdir(cwd)
+        os.execvp("claude", cmd)
+
+
+def cmd_start(args):
+    """Start a new session."""
+    cwd = os.path.expanduser(args.directory)
+    if not os.path.isdir(cwd):
+        print(f"Directory not found: {cwd}")
+        sys.exit(1)
+
+    cmd = ["claude"] + DEFAULT_FLAGS
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    output_file = os.path.join(RESULTS_DIR, f"{args.name}.txt")
+
+    if args.prompt:
+        if args.background:
+            # Write prompt to temp file to avoid shell quoting issues
+            prompt_file = os.path.join(RESULTS_DIR, f"{args.name}.prompt")
+            with open(prompt_file, "w") as pf:
+                pf.write(args.prompt)
+            flags = " ".join(cmd[1:])
+            tmux_cmd = f'cd {cwd} && claude {flags} -p "$(cat {prompt_file})" 2>&1 | tee {output_file}'
+            subprocess.run(["tmux", "new-window", "-n", args.name, "-d", tmux_cmd])
+            print(f"Started in tmux window '{args.name}' (output: {output_file})")
+        else:
+            cmd_with_prompt = cmd + ["-p", args.prompt]
+            os.chdir(cwd)
+            os.execvp("claude", cmd_with_prompt)
+    else:
+        if args.background:
+            tmux_cmd = f"cd {cwd} && {' '.join(cmd)}"
+            subprocess.run(["tmux", "new-window", "-n", args.name, "-d", tmux_cmd])
+            print(f"Started in tmux window '{args.name}'")
+        else:
+            os.chdir(cwd)
+            os.execvp("claude", cmd)
+
+
+def find_tty_for_pid(pid):
+    """Find the tty device path for a given PID."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "tty="],
+            capture_output=True, text=True
+        )
+        tty = result.stdout.strip()
+        if tty and tty != "??":
+            return f"/dev/{tty}"
+    except Exception:
+        pass
+    return None
+
+
+def send_keystrokes_to_tty(tty_path, text):
+    """Send keystrokes to a Terminal.app tab matching the given tty device.
+
+    Uses AppleScript to find the Terminal.app tab, bring it to front,
+    send keystrokes via System Events, then return focus.
+
+    Requires Accessibility permissions for Terminal.app.
+    """
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+
+    script = f'''
+        set origApp to name of (info for (path to frontmost application))
+
+        tell application "Terminal"
+            set targetFound to false
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "{tty_path}" then
+                        set selected of t to true
+                        set index of w to 1
+                        set targetFound to true
+                        exit repeat
+                    end if
+                end repeat
+                if targetFound then exit repeat
+            end repeat
+
+            if not targetFound then
+                return "error: tty {tty_path} not found in Terminal.app"
+            end if
+        end tell
+
+        delay 0.1
+
+        tell application "System Events"
+            tell process "Terminal"
+                keystroke "{escaped}"
+                keystroke return
+            end tell
+        end tell
+
+        delay 0.2
+        tell application origApp to activate
+
+        return "sent"
+    '''
+
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        error = result.stderr.strip()
+        if "not allowed to send keystrokes" in error:
+            print("Error: Accessibility permissions required.")
+            print("Grant access: System Preferences > Privacy & Security > Accessibility > Terminal.app")
+            sys.exit(1)
+        raise RuntimeError(f"AppleScript failed: {error}")
+
+    output = result.stdout.strip()
+    if output.startswith("error:"):
+        raise RuntimeError(output)
+
+    return output
+
+
+def find_session_jsonl(session_id):
+    """Find the JSONL file for a session."""
+    for jsonl in glob.glob(os.path.join(PROJECTS_DIR, "*", f"{session_id}.jsonl")):
+        return jsonl
+    return None
+
+
+def extract_assistant_text(line):
+    """Extract text content from a JSONL line if it's an assistant message."""
+    try:
+        data = json.loads(line)
+        msg = data.get("message", {})
+        if msg.get("role") != "assistant":
+            return None
+        content = msg.get("content", "")
+        texts = []
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    texts.append(c["text"])
+                elif isinstance(c, dict) and c.get("type") == "tool_use":
+                    texts.append(f"[tool: {c.get('name')}]")
+        elif isinstance(content, str):
+            texts.append(content)
+        text = " | ".join(texts).strip()
+        return text if text else None
+    except Exception:
+        return None
+
+
+def wait_for_response(jsonl_path, initial_size, timeout=120):
+    """Watch a JSONL file using kqueue and return new assistant messages.
+
+    Uses macOS kqueue (via select.kqueue) for instant file change notification.
+    """
+    fd = os.open(jsonl_path, os.O_RDONLY)
+    kq = select.kqueue()
+
+    ev = select.kevent(
+        fd,
+        filter=select.KQ_FILTER_VNODE,
+        flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+        fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND,
+    )
+    kq.control([ev], 0, 0)
+
+    f = open(jsonl_path, "r")
+    f.seek(initial_size)
+
+    deadline = time.time() + timeout
+    assistant_responses = []
+    saw_user_message = False
+    last_response_time = None
+
+    try:
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+
+            events = kq.control(None, 1, min(remaining, 2.0))
+
+            new_lines = f.readlines()
+            for line in new_lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    data = json.loads(line)
+                    msg = data.get("message", {})
+                    if msg.get("role") == "user":
+                        saw_user_message = True
+                except Exception:
+                    pass
+
+                if saw_user_message:
+                    text = extract_assistant_text(line)
+                    if text:
+                        assistant_responses.append(text)
+                        last_response_time = time.time()
+
+            if last_response_time and (time.time() - last_response_time) > 3.0:
+                break
+
+    finally:
+        f.close()
+        kq.close()
+        os.close(fd)
+
+    return assistant_responses
+
+
+def find_session(sessions, query):
+    """Find a session by ID, partial ID, or project name."""
+    # Exact match
+    for s in sessions:
+        if s["session_id"] == query:
+            return s
+
+    # Partial ID match
+    matches = [s for s in sessions if s["session_id"].startswith(query)]
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        print(f"Ambiguous ID '{query}', matches:")
+        for m in matches:
+            print(f"  {m['session_id']}  {m['project']}  {m['topic'][:60]}")
+        sys.exit(1)
+
+    # Project name match
+    matches = [s for s in sessions if query.lower() in s["project"].lower()]
+    if len(matches) >= 1:
+        return matches[0]
+
+    print(f"No session found matching '{query}'")
+    sys.exit(1)
+
+
+def cmd_send(args):
+    """Send a message to an active session via keystroke injection."""
+    sessions = get_all_sessions(active_only=True)
+    match = find_session(sessions, args.session)
+
+    tty = find_tty_for_pid(match["pid"])
+    if not tty:
+        print(f"Could not find tty for PID {match['pid']}")
+        sys.exit(1)
+
+    message = " ".join(args.message)
+
+    jsonl_path = find_session_jsonl(match["session_id"])
+    initial_size = os.path.getsize(jsonl_path) if jsonl_path else 0
+
+    print(f"Sending to {match['project']} (PID {match['pid']}, {tty})...")
+    try:
+        send_keystrokes_to_tty(tty, message)
+        print(f"Sent: {message[:80]}")
+    except RuntimeError as e:
+        print(f"Failed: {e}")
+        sys.exit(1)
+
+    if args.wait and jsonl_path:
+        timeout = args.timeout
+        print(f"Waiting for response (timeout {timeout}s)...")
+        responses = wait_for_response(jsonl_path, initial_size, timeout)
+        if responses:
+            print(f"\n--- Response from {match['project']} ---")
+            for r in responses:
+                print(r)
+            print("--- End ---")
+        else:
+            print("No response received within timeout.")
+
+        if args.json:
+            print(json.dumps({"responses": responses}))
+
+
+def cmd_read(args):
+    """Read recent conversation from a session's JSONL file."""
+    sessions = get_all_sessions()
+    match = find_session(sessions, args.session)
+
+    jsonl_path = find_session_jsonl(match["session_id"])
+    if not jsonl_path:
+        print(f"No conversation file found for {match['session_id']}")
+        sys.exit(1)
+
+    n = args.lines
+    lines = open(jsonl_path).readlines()
+
+    recent = []
+    for line in lines[-(n * 3):]:
+        try:
+            data = json.loads(line)
+            msg = data.get("message", {})
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                texts = []
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        texts.append(c["text"][:300])
+                    elif isinstance(c, dict) and c.get("type") == "tool_use":
+                        texts.append(f"[tool: {c.get('name')}]")
+                text = " | ".join(texts)
+            else:
+                text = str(content)[:300]
+            if text.strip():
+                role_icon = "\033[34mUSER\033[0m" if role == "user" else "\033[32mASST\033[0m"
+                recent.append(f"  {role_icon}: {text[:200]}")
+        except Exception:
+            pass
+
+    print(f"\n  Session: {match['session_id']}")
+    print(f"  Project: {match['project']}")
+    print(f"  Status:  {'ALIVE' if match['active'] else 'dead'}")
+    print(f"  Last {n} messages:\n")
+    for r in recent[-n:]:
+        print(r)
+    print()
+
+
+def cmd_result(args):
+    """Read the output from a session started with -p flag."""
+    output_file = os.path.join(RESULTS_DIR, f"{args.session}.txt")
+
+    if not os.path.exists(output_file):
+        for f in os.listdir(RESULTS_DIR):
+            if args.session.lower() in f.lower():
+                output_file = os.path.join(RESULTS_DIR, f)
+                break
+        else:
+            print(f"No output file for '{args.session}'")
+            sys.exit(1)
+
+    content = open(output_file).read().strip()
+    if not content:
+        print("Session is still running (no output yet)")
+    else:
+        print(content)
+
+
+def cmd_kill(args):
+    """Kill a session by ID or name."""
+    sessions = get_all_sessions(active_only=True)
+    match = find_session(sessions, args.session)
+
+    try:
+        os.kill(match["pid"], 15)
+        print(f"Killed PID {match['pid']} ({match['project']})")
+        print(f"Resume later: claude-sessions resume {match['session_id']}")
+    except Exception as e:
+        print(f"Failed to kill: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Claude Code session manager")
+    sub = parser.add_subparsers(dest="command")
+
+    # list
+    p_list = sub.add_parser("list", aliases=["ls"], help="List all sessions")
+    p_list.add_argument("-a", "--active", action="store_true", help="Active only")
+    p_list.add_argument("-n", "--limit", type=int, default=25, help="Max results")
+    p_list.add_argument("--json", action="store_true", help="JSON output")
+    p_list.set_defaults(func=cmd_list)
+
+    # ids
+    p_ids = sub.add_parser("ids", help="Show session IDs for copy-paste")
+    p_ids.add_argument("-a", "--active", action="store_true", help="Active only")
+    p_ids.set_defaults(func=cmd_ids)
+
+    # resume
+    p_resume = sub.add_parser("resume", help="Resume a session")
+    p_resume.add_argument("session", help="Session ID, partial ID, or project name")
+    p_resume.add_argument("-b", "--background", action="store_true", help="Resume in tmux")
+    p_resume.set_defaults(func=cmd_resume)
+
+    # start
+    p_start = sub.add_parser("start", help="Start a new session")
+    p_start.add_argument("name", help="Session name (tmux window name)")
+    p_start.add_argument("directory", help="Working directory")
+    p_start.add_argument("-b", "--background", action="store_true", help="Start in tmux")
+    p_start.add_argument("-p", "--prompt", type=str, default=None,
+                        help="Initial prompt (uses -p flag for non-interactive mode)")
+    p_start.set_defaults(func=cmd_start)
+
+    # send
+    p_send = sub.add_parser("send", help="Send a message to an active session")
+    p_send.add_argument("session", help="Session ID, partial ID, or project name")
+    p_send.add_argument("message", nargs="+", help="Message to send")
+    p_send.add_argument("-w", "--wait", action="store_true",
+                        help="Wait for response using kqueue file watching")
+    p_send.add_argument("-t", "--timeout", type=int, default=120,
+                        help="Max seconds to wait (default: 120)")
+    p_send.add_argument("--json", action="store_true", help="Output response as JSON")
+    p_send.set_defaults(func=cmd_send)
+
+    # read
+    p_read = sub.add_parser("read", help="Read recent messages from a session")
+    p_read.add_argument("session", help="Session ID, partial ID, or project name")
+    p_read.add_argument("-n", "--lines", type=int, default=10, help="Number of messages")
+    p_read.set_defaults(func=cmd_read)
+
+    # result
+    p_result = sub.add_parser("result", help="Read output from a -p session")
+    p_result.add_argument("session", help="Session name")
+    p_result.set_defaults(func=cmd_result)
+
+    # kill
+    p_kill = sub.add_parser("kill", help="Kill an active session")
+    p_kill.add_argument("session", help="Session ID or project name")
+    p_kill.set_defaults(func=cmd_kill)
+
+    args = parser.parse_args()
+    if not args.command:
+        args.active = False
+        args.limit = 25
+        args.json = False
+        cmd_list(args)
+    else:
+        args.func(args)
+
+
+if __name__ == "__main__":
+    main()
