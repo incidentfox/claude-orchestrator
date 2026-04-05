@@ -87,6 +87,18 @@ Phone Call → Retell AI → ngrok → bridge/server.js → claude-sessions CLI 
 Telegram   → Claude Code Telegram Plugin → This session (orchestrator)
 ```
 
+### The orchestrator pattern
+
+After setup, the user should run one Claude Code session as the "orchestrator" — started from `~` with Telegram enabled. This session:
+- Is the only one with Telegram access (the user's mobile control channel)
+- Manages all other sessions via `claude-sessions` CLI
+- Receives status updates from other sessions (they message the orchestrator to relay to the user)
+- Is the session the voice agent's tools interact with
+
+Other sessions can reach the user by sending a message to the orchestrator: `claude-sessions send <orchestrator> "Please tell the user via Telegram: <message>"`
+
+The setup script should also add cross-session communication instructions to `~/.claude/CLAUDE.md` so all future sessions automatically know about `claude-sessions` and the orchestrator.
+
 ## Platform Requirements
 
 - **macOS only** — Uses AppleScript for cross-session message injection (Terminal.app + Accessibility permissions required)

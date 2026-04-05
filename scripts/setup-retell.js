@@ -257,7 +257,10 @@ RULES:
 - NEVER ask "are you still there" or "is there anything else."
 - NEVER guess or make up information. If unsure, say "let me check" and use a tool.
 - When reading session output, summarize briefly — don't read raw terminal output.
-- Be direct. "3 sessions running, forta is the busiest" not "I can see that you currently have..."
+- Be direct. "3 sessions running, the main one is the busiest" not "I can see that you currently have..."
+
+ARCHITECTURE:
+There is a main orchestrator session (runs from ~) that has Telegram access and coordinates all other sessions. You are the voice interface to the same system. When the user asks you to do something, you're calling tools that interact with the same sessions the orchestrator manages. The orchestrator can also relay messages to the user via Telegram.
 
 TOOLS:
 - list_sessions: See what's running
@@ -284,7 +287,7 @@ async function main() {
   // Step 2: Create Agent
   console.log("2. Creating voice agent...");
   const agent = await retellAPI("POST", "/create-agent", {
-    agent_name: "Claude Orchestrator",
+    agent_name: "CallClaude",
     response_engine: { type: "retell-llm", llm_id: llm.llm_id },
     voice_id: "11labs-Brian",
     language: "en-US",
