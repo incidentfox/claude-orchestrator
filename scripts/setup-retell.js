@@ -67,6 +67,13 @@ if (!ngrokUrl) {
   process.exit(1);
 }
 
+// Ensure API_SECRET exists — generate one if not
+let apiSecret = process.env.API_SECRET;
+if (!apiSecret) {
+  apiSecret = require("crypto").randomBytes(32).toString("hex");
+  console.log(`Generated API_SECRET: ${apiSecret.slice(0, 8)}...`);
+}
+
 const WEBHOOK_URL = `${ngrokUrl}/retell/tool`;
 const EVENTS_WEBHOOK = `${ngrokUrl}/retell/webhook`;
 
@@ -111,7 +118,7 @@ const TOOLS = [
     type: "custom",
     name: "list_sessions",
     description: "List all Claude Code sessions (active and dead). Returns session IDs, projects, status, and topics.",
-    url: WEBHOOK_URL,
+    url: WEBHOOK_URL + `?secret=${apiSecret}`,
     speak_during_execution: true,
     speak_after_execution: true,
     parameters: {
@@ -128,7 +135,7 @@ const TOOLS = [
     type: "custom",
     name: "send_message",
     description: "Send a message to an active Claude Code session. Can optionally wait for the response.",
-    url: WEBHOOK_URL,
+    url: WEBHOOK_URL + `?secret=${apiSecret}`,
     speak_during_execution: true,
     speak_after_execution: true,
     execution_message_description: "Sending message to session...",
@@ -159,7 +166,7 @@ const TOOLS = [
     type: "custom",
     name: "read_session",
     description: "Read recent messages from a Claude Code session's conversation history.",
-    url: WEBHOOK_URL,
+    url: WEBHOOK_URL + `?secret=${apiSecret}`,
     speak_during_execution: true,
     speak_after_execution: true,
     parameters: {
@@ -181,7 +188,7 @@ const TOOLS = [
     type: "custom",
     name: "start_session",
     description: "Start a new Claude Code session in the background.",
-    url: WEBHOOK_URL,
+    url: WEBHOOK_URL + `?secret=${apiSecret}`,
     speak_during_execution: true,
     speak_after_execution: true,
     execution_message_description: "Starting new session...",
@@ -208,7 +215,7 @@ const TOOLS = [
     type: "custom",
     name: "get_result",
     description: "Get the output from a session that was started with a prompt (-p flag).",
-    url: WEBHOOK_URL,
+    url: WEBHOOK_URL + `?secret=${apiSecret}`,
     speak_during_execution: true,
     speak_after_execution: true,
     parameters: {
@@ -226,7 +233,7 @@ const TOOLS = [
     type: "custom",
     name: "kill_session",
     description: "Kill an active Claude Code session.",
-    url: WEBHOOK_URL,
+    url: WEBHOOK_URL + `?secret=${apiSecret}`,
     speak_during_execution: true,
     speak_after_execution: true,
     parameters: {
@@ -315,6 +322,7 @@ async function main() {
     return content + `\n${key}=${value}`;
   }
 
+  envContent = setEnvVar(envContent, "API_SECRET", apiSecret);
   envContent = setEnvVar(envContent, "RETELL_AGENT_ID", agent.agent_id);
   envContent = setEnvVar(envContent, "RETELL_LLM_ID", llm.llm_id);
   if (phoneNumber) {

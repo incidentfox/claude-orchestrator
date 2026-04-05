@@ -27,6 +27,34 @@ fs.mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
 
 const PORT = process.env.PORT || 3456;
 const CLAUDE_SESSIONS = process.env.CLAUDE_SESSIONS_PATH || "claude-sessions";
+const API_SECRET = process.env.API_SECRET;
+const ALLOWED_PHONE_NUMBERS = (process.env.ALLOWED_PHONE_NUMBERS || "")
+  .split(",")
+  .map((n) => n.trim())
+  .filter(Boolean);
+
+if (!API_SECRET) {
+  console.error("FATAL: API_SECRET not set in .env — refusing to start without auth.");
+  console.error("Generate one: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"");
+  process.exit(1);
+}
+
+// Auth middleware — every request must include the API secret
+function requireAuth(req, res, next) {
+  const token =
+    req.headers["x-api-secret"] ||
+    req.headers["authorization"]?.replace("Bearer ", "") ||
+    req.query?.secret;
+
+  if (token !== API_SECRET) {
+    console.log(`[auth] Rejected request from ${req.ip} to ${req.path}`);
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
+app.use("/retell", requireAuth);
+app.use("/vapi", requireAuth);
 
 // Strip ANSI codes and control characters that break JSON
 function clean(str) {
@@ -196,8 +224,15 @@ app.post("/retell/webhook", async (req, res) => {
   );
 
   switch (event) {
-    case "call_started":
-      console.log(`[retell-webhook] Call started from ${call?.from_number}`);
+    case "call_started": {
+      const from = call?.from_number;
+      console.log(`[retell-webhook] Call started from ${from}`);
+
+      // Phone number allowlist
+      if (ALLOWED_PHONE_NUMBERS.length > 0 && from && !ALLOWED_PHONE_NUMBERS.includes(from)) {
+        console.log(`[retell-webhook] BLOCKED call from ${from} — not in allowlist`);
+        return res.status(200).json({});
+      }
       fs.writeFileSync(
         LIVE_TRANSCRIPT_FILE,
         JSON.stringify(
@@ -212,6 +247,7 @@ app.post("/retell/webhook", async (req, res) => {
         )
       );
       break;
+    }
 
     case "transcript_updated": {
       const turns = call?.transcript_with_tool_calls || [];

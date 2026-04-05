@@ -6,15 +6,20 @@ Talk to your local Claude Code sessions from your phone.
 
 I run a bunch of Claude Code sessions on my laptop and lose track of which terminal is doing what. I wanted to check on them from my car — but I drive a Tesla and didn't want to deal with getting an app on the Tesla browser. A phone call bypasses all of that.
 
-## What it does
+## How it works
 
-You get a phone number. Call it, say "what's running" and it tells you. Say "tell the main session to check the build" and it types that into the right terminal on your Mac. Everything stays local — your sessions run on your laptop, the bridge runs on your laptop, the phone call just tunnels in through ngrok.
+You get a phone number via Retell AI. When you call it, Retell does speech-to-text, sends the text to Claude Sonnet which decides what tool to call, and hits your bridge server through an ngrok tunnel. The bridge server runs on your Mac and translates tool calls into `claude-sessions` CLI commands — which find the right Terminal.app tab by tty device path, inject keystrokes via AppleScript, and watch the JSONL conversation file with kqueue for the response. Everything runs locally. Retell only sees tool call names and results.
 
 ```
-Your phone → Retell AI → ngrok → bridge server → claude-sessions CLI → Terminal.app → Claude Code
+Your phone → Retell AI (STT + LLM) → ngrok → bridge server → claude-sessions → Terminal.app → Claude Code
 ```
 
-Cross-session messaging works via AppleScript keystroke injection — finds the right Terminal.app tab by tty device path, types into it, watches the JSONL file with kqueue for the response. It's a hack and it works.
+## Security
+
+- **API secret** — the bridge server rejects all requests without a secret token (generated during setup, passed as query param on Retell tool URLs). Without it, discovering your ngrok URL does nothing.
+- **Phone allowlist** — set `ALLOWED_PHONE_NUMBERS` in `.env` to restrict who can call your agent. Only your number gets through.
+- **`--dangerously-skip-permissions`** — sessions started by this tool run with permissions disabled so the voice agent can actually do things without getting stuck on confirmation prompts. This is a tradeoff: the voice agent (and anyone who can call your number) can run arbitrary commands. The phone allowlist is your access control.
+- **ngrok** — the tunnel is the only thing exposed to the internet. Kill ngrok and nothing is reachable.
 
 ## Install
 

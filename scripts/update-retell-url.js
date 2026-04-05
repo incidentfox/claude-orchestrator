@@ -30,9 +30,11 @@ if (fs.existsSync(envPath)) {
 const API_KEY = process.env.RETELL_API_KEY;
 const LLM_ID = process.env.RETELL_LLM_ID;
 const AGENT_ID = process.env.RETELL_AGENT_ID;
+const API_SECRET = process.env.API_SECRET;
 
 if (!API_KEY) { console.error("RETELL_API_KEY not set"); process.exit(1); }
 if (!LLM_ID) { console.error("RETELL_LLM_ID not set (run setup-retell.js first)"); process.exit(1); }
+if (!API_SECRET) { console.error("API_SECRET not set"); process.exit(1); }
 
 // Get ngrok URL
 let ngrokUrl = process.argv[2];
@@ -49,8 +51,8 @@ if (!ngrokUrl) {
   process.exit(1);
 }
 
-const WEBHOOK_URL = `${ngrokUrl}/retell/tool`;
-const EVENTS_WEBHOOK = `${ngrokUrl}/retell/webhook`;
+const WEBHOOK_URL = `${ngrokUrl}/retell/tool?secret=${API_SECRET}`;
+const EVENTS_WEBHOOK = `${ngrokUrl}/retell/webhook?secret=${API_SECRET}`;
 
 function retellAPI(method, endpoint, body) {
   return new Promise((resolve, reject) => {
