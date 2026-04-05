@@ -1,6 +1,8 @@
 # Claude Orchestrator
 
-Manage multiple Claude Code sessions from anywhere — terminal, Telegram, or phone calls.
+Control your Claude Code sessions from your phone.
+
+If you're running multiple Claude Code sessions — one on a refactor, one on tests, one researching docs — you're alt-tabbing between terminals to check on them. Close your laptop and you lose visibility entirely. This gives you a single control plane: a CLI to manage all sessions, a Telegram bot for quick check-ins, and a phone number you can call to list sessions, send commands, read responses, and spin up new work — all by voice while you're away from your desk.
 
 ```
 Phone Call → Retell AI → ngrok → Bridge Server → claude-sessions → Claude Code
