@@ -31,6 +31,32 @@ node bridge/server.js              # Terminal 2
 node scripts/setup-retell.js       # One-time: creates voice agent + phone number
 ```
 
+## What This Looks Like
+
+Here's a real phone call transcript — calling the voice agent to check on running Claude Code sessions and delegate a task:
+
+> **Agent:** Hey. What's up?
+>
+> **You:** What are the active sessions?
+>
+> **Agent:** One sec!
+>
+> **Agent:** Looks like you've got 6 active sessions running — forta, evolve, job search, and a couple others at the home directory.
+>
+> **You:** Can you check what files are in my downloads folder?
+>
+> **Agent:** I can send that command to one of your sessions — one sec!
+>
+> **You:** Actually, you should spin up a fresh session for that. And be patient — it sometimes takes time to execute. It might not be immediately available.
+>
+> **Agent:** Got it, that makes total sense — I'll spin up a fresh session and give it time to run before checking the output.
+>
+> **You:** Yeah. So go ahead, check what files are in my downloads folder.
+>
+> **Agent:** One sec, let me start a fresh session for that! Alright, I sent it over — give it a moment to run and I'll check back for the results.
+
+The voice agent calls `list_sessions`, `send_message`, and `start_session` tools behind the scenes — you just talk naturally.
+
 ## What You Get
 
 ### `claude-sessions` CLI
