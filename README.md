@@ -43,23 +43,23 @@ node scripts/setup-retell.js       # One-time: creates voice agent + phone numbe
 
 ## What This Looks Like
 
-Here's a real phone call transcript — calling the voice agent to check on running Claude Code sessions and delegate a task:
+Here's a real phone call (2 min) — calling the voice agent to check on running sessions and delegate a task:
+
+https://github.com/incidentfox/claude-orchestrator/raw/main/demo-call.mp3
 
 > **Agent:** Hey. What's up?
 >
 > **You:** What are the active sessions?
 >
-> **Agent:** One sec!
->
-> **Agent:** Looks like you've got 6 active sessions running — forta, evolve, job search, and a couple others at the home directory.
+> **Agent:** One sec! Looks like you've got 6 active sessions running — forta, evolve, job search, and a couple others at the home directory.
 >
 > **You:** Can you check what files are in my downloads folder?
 >
 > **Agent:** I can send that command to one of your sessions — one sec!
 >
-> **You:** Actually, you should spin up a fresh session for that. And be patient — it sometimes takes time to execute. It might not be immediately available.
+> **You:** Actually, you should spin up a fresh session for that. And be patient — it sometimes takes time to execute.
 >
-> **Agent:** Got it, that makes total sense — I'll spin up a fresh session and give it time to run before checking the output.
+> **Agent:** Got it — I'll spin up a fresh session and give it time to run before checking the output.
 >
 > **You:** Yeah. So go ahead, check what files are in my downloads folder.
 >
