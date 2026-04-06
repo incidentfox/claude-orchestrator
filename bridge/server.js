@@ -317,6 +317,17 @@ app.post("/retell/webhook", async (req, res) => {
           2
         )
       );
+      // Download recording locally
+      const recordingUrl = call?.recording_url;
+      if (recordingUrl) {
+        const wavPath = path.join(TRANSCRIPTS_DIR, `retell_${callId}.wav`);
+        console.log(`[retell-webhook] Downloading recording to ${wavPath}`);
+        exec(`curl -sL "${recordingUrl}" -o "${wavPath}"`, (err) => {
+          if (err) console.error(`[retell-webhook] Recording download failed: ${err.message}`);
+          else console.log(`[retell-webhook] Recording saved: ${wavPath}`);
+        });
+      }
+
       try {
         fs.unlinkSync(LIVE_TRANSCRIPT_FILE);
       } catch {}
