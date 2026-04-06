@@ -32,7 +32,7 @@ RESULTS_DIR = os.path.join(HOME, ".claude/voice-results")
 DEFAULT_FLAGS = [
     "--dangerously-skip-permissions",
     "--chrome",
-    "--channels", "plugin:telegram@claude-plugins-official",
+
 ]
 
 
