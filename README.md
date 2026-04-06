@@ -12,6 +12,10 @@ Clone https://github.com/incidentfox/callclaude.git into ~/development/, read th
 
 Requires macOS, [tmux](https://github.com/tmux/tmux), [ngrok](https://ngrok.com/), Node.js 18+, [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code).
 
+## Demo (real call, ~1 min)
+
+<video src="https://github.com/incidentfox/callclaude/raw/main/demo.mp4" controls width="100%"></video>
+
 ## Why
 
 I run a bunch of Claude Code sessions on my laptop and lose track of which terminal is doing what. I wanted to check on them from my car — but I drive a Tesla and didn't want to deal with getting an app on the Tesla browser. A phone call bypasses all of that.
