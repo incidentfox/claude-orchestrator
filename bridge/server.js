@@ -119,12 +119,15 @@ async function handleToolCall(name, params) {
       const { session, message, wait_for_response } = params;
       if (!session || !message) return "Error: session and message are required";
 
+      // Prefix so the receiving session knows this is from a live phone call
+      const prefixed = `[LIVE VOICE CALL — respond quickly and concisely, someone is waiting on the phone] ${message}`;
+
       if (wait_for_response) {
         const timeout = params.timeout || 60;
-        const output = await runSendWait(session, message, timeout);
+        const output = await runSendWait(session, prefixed, timeout);
         return clean(output);
       } else {
-        const escaped = message.replace(/"/g, '\\"');
+        const escaped = prefixed.replace(/"/g, '\\"');
         return runSessions(`send "${session}" "${escaped}"`);
       }
     }
