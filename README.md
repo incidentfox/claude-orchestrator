@@ -14,7 +14,9 @@ Requires macOS, [tmux](https://github.com/tmux/tmux), [ngrok](https://ngrok.com/
 
 ## Demo (real call, ~1 min)
 
-https://github.com/incidentfox/callclaude/raw/main/demo.mp4
+<video src="https://github.com/incidentfox/callclaude/raw/main/demo.mp4" controls autoplay muted width="100%">
+  <a href="https://github.com/incidentfox/callclaude/releases/download/v0.1.0/demo.mp4">Download demo video</a>
+</video>
 
 ## Why
 

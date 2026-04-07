@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code session manager - list, resume, send, read, start, kill sessions.
-
-Works by reading Claude Code's internal session files (~/.claude/sessions/*.json
-for PIDs, ~/.claude/projects/*/SESSION_ID.jsonl for conversation history) and
-using AppleScript keystroke injection for cross-session communication on macOS.
-
-Requirements:
-  - macOS (AppleScript + Terminal.app)
-  - Accessibility permissions for Terminal.app
-  - tmux (for background sessions)
-  - Claude Code CLI in PATH
-"""
+"""Claude Code session manager - list, resume, and start sessions."""
 
 import json
 import os
@@ -22,31 +11,57 @@ import argparse
 import select
 import time
 
-HOME = os.path.expanduser("~")
-SESSIONS_DIR = os.path.join(HOME, ".claude/sessions")
-PROJECTS_DIR = os.path.join(HOME, ".claude/projects")
-RESULTS_DIR = os.path.join(HOME, ".claude/voice-results")
+SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+SUMMARIES_FILE = os.path.expanduser("~/.claude/session-summaries.json")
+ARCHIVE_FILE = os.path.expanduser("~/.claude/session-archive.json")
 
-# Flags applied to all sessions started/resumed by this tool.
-# Edit these to match your preferences.
 DEFAULT_FLAGS = [
     "--dangerously-skip-permissions",
     "--chrome",
-
 ]
+
+
+def load_summaries():
+    """Load session summaries from disk."""
+    try:
+        with open(SUMMARIES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_summaries(summaries):
+    """Save session summaries to disk."""
+    with open(SUMMARIES_FILE, "w") as f:
+        json.dump(summaries, f, indent=2)
+
+
+def load_archive():
+    """Load set of archived session IDs."""
+    try:
+        with open(ARCHIVE_FILE) as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def save_archive(archive_set):
+    """Save archived session IDs."""
+    with open(ARCHIVE_FILE, "w") as f:
+        json.dump(sorted(archive_set), f, indent=2)
 
 
 def get_active_sessions():
     """Get currently active sessions from PID files."""
     active = {}
-    if not os.path.isdir(SESSIONS_DIR):
-        return active
     for f in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
         try:
             with open(f) as fh:
                 data = json.load(fh)
                 sid = data.get("sessionId")
                 pid = data.get("pid")
+                # Check if process is actually alive
                 if pid:
                     try:
                         os.kill(pid, 0)
@@ -58,36 +73,126 @@ def get_active_sessions():
     return active
 
 
-def get_first_user_message(jsonl_path):
-    """Extract the first user message as a topic summary."""
+def extract_json_string_field(text, field):
+    """Extract a JSON string field value from raw text (mimics Claude Code's extractJsonStringField)."""
+    import re
+    pattern = rf'"{field}"\s*:\s*"((?:[^"\\]|\\.)*)"'
+    m = re.search(pattern, text)
+    if m:
+        val = m.group(1).replace("\\n", " ").replace('\\"', '"').strip()
+        return val if val else None
+    return None
+
+
+def extract_last_json_string_field(text, field):
+    """Extract the LAST occurrence of a JSON string field (mimics Claude Code's extractLastJsonStringField)."""
+    import re
+    pattern = rf'"{field}"\s*:\s*"((?:[^"\\]|\\.)*)"'
+    matches = list(re.finditer(pattern, text))
+    if matches:
+        val = matches[-1].group(1).replace("\\n", " ").replace('\\"', '"').strip()
+        return val if val else None
+    return None
+
+
+def read_session_metadata(jsonl_path):
+    """Read head + tail of JSONL to extract session metadata (mirrors Claude Code's native approach)."""
+    HEAD_BYTES = 32768  # 32KB to catch user messages after metadata preamble
+    TAIL_BYTES = 8192
     try:
-        with open(jsonl_path) as fh:
-            for line in fh:
+        size = os.path.getsize(jsonl_path)
+        with open(jsonl_path, "rb") as f:
+            head = f.read(HEAD_BYTES).decode("utf-8", errors="replace")
+            if size > HEAD_BYTES:
+                f.seek(max(0, size - TAIL_BYTES))
+                tail = f.read(TAIL_BYTES).decode("utf-8", errors="replace")
+            else:
+                tail = head
+    except Exception:
+        return {}
+
+    # Extract native Claude Code fields (priority order mirrors listSessionsImpl.ts)
+    custom_title = (
+        extract_last_json_string_field(tail, "customTitle")
+        or extract_last_json_string_field(head, "customTitle")
+    )
+    ai_title = (
+        extract_last_json_string_field(tail, "aiTitle")
+        or extract_last_json_string_field(head, "aiTitle")
+    )
+    last_prompt = extract_last_json_string_field(tail, "lastPrompt")
+
+    # First user message as fallback -- try multiple extraction methods
+    first_prompt = extract_json_string_field(head, "firstPrompt")
+
+    if not first_prompt:
+        try:
+            for line in head.split("\n"):
+                if not line.strip():
+                    continue
                 try:
                     data = json.loads(line)
+                    # Standard user message
                     msg = data.get("message", {})
                     if msg.get("role") == "user":
                         content = msg.get("content", "")
                         if isinstance(content, list):
                             for c in content:
                                 if isinstance(c, dict) and c.get("type") == "text":
-                                    return c["text"][:120].replace("\n", " ").strip()
+                                    first_prompt = c["text"][:200].replace("\n", " ").strip()
+                                    break
                         elif isinstance(content, str):
-                            return content[:120].replace("\n", " ").strip()
-                except Exception:
+                            first_prompt = content[:200].replace("\n", " ").strip()
+                        if first_prompt:
+                            break
+                    # Headless -p sessions: prompt is in queue-operation content
+                    if data.get("type") == "queue-operation" and data.get("operation") == "enqueue":
+                        content = data.get("content", "")
+                        if content:
+                            first_prompt = content[:200].replace("\n", " ").strip()
+                            break
+                except json.JSONDecodeError:
                     pass
-    except Exception:
-        pass
-    return ""
+        except Exception:
+            pass
+
+    # Last resort: simple string search for content field (handles no-newline files)
+    if not first_prompt:
+        marker = '"content":"'
+        idx = head.find(marker)
+        if idx >= 0:
+            start = idx + len(marker)
+            # Find the closing quote (not escaped)
+            end = start
+            while end < len(head) and end < start + 300:
+                if head[end] == '"' and head[end-1:end] != '\\':
+                    break
+                end += 1
+            val = head[start:end][:200].replace("\\n", " ").replace("\\'", "'").replace('\\"', '"').strip()
+            if len(val) >= 5:
+                first_prompt = val
+
+    # Clean up noisy prefixes
+    if first_prompt:
+        for noise in ["<local-command-caveat>", "This session is being continued from a previous"]:
+            if first_prompt.startswith(noise):
+                first_prompt = None
+                break
+
+    return {
+        "custom_title": custom_title,
+        "ai_title": ai_title,
+        "last_prompt": last_prompt,
+        "first_prompt": first_prompt,
+    }
 
 
-def get_all_sessions(limit=None, active_only=False):
+def get_all_sessions(limit=None, active_only=False, include_archived=False):
     """Get all sessions with metadata."""
     active = get_active_sessions()
+    summaries = load_summaries()
+    archived = load_archive() if not include_archived else set()
     sessions = []
-
-    if not os.path.isdir(PROJECTS_DIR):
-        return sessions
 
     for jsonl in glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")):
         sid = os.path.basename(jsonl).replace(".jsonl", "")
@@ -95,22 +200,27 @@ def get_all_sessions(limit=None, active_only=False):
         size = os.path.getsize(jsonl)
         mtime = os.path.getmtime(jsonl)
         is_active = sid in active
+        is_archived = sid in archived
 
         if active_only and not is_active:
             continue
 
-        # Prettify project path: -Users-foo-dev-project → ~/dev/project
-        project = project_dir
-        home_prefix = f"-Users-{os.path.basename(HOME)}-"
-        if project.startswith(home_prefix):
-            project = "~/" + project[len(home_prefix):].replace("-", "/")
-        elif project == f"-Users-{os.path.basename(HOME)}":
+        # Hide archived unless explicitly requested (but never hide active sessions)
+        if is_archived and not include_archived and not is_active:
+            continue
+
+        # Prettify project path
+        project = project_dir.replace("-Users-jimmywei-", "~/").replace("-", "/")
+        if project == "/Users/jimmywei":
             project = "~"
-        else:
-            project = project.replace("-", "/")
 
         active_info = active.get(sid, {})
-        topic = get_first_user_message(jsonl)
+        meta = read_session_metadata(jsonl)
+
+        # Title priority: custom_title > ai_title > our summary > last_prompt > first_prompt
+        title = meta.get("custom_title") or meta.get("ai_title")
+        our_summary = summaries.get(sid)
+        topic = meta.get("first_prompt") or meta.get("last_prompt") or "(no topic)"
 
         sessions.append({
             "session_id": sid,
@@ -118,20 +228,85 @@ def get_all_sessions(limit=None, active_only=False):
             "size_kb": round(size / 1024),
             "last_modified": datetime.datetime.fromtimestamp(mtime),
             "active": is_active,
+            "archived": is_archived,
             "pid": active_info.get("pid"),
             "cwd": active_info.get("cwd"),
-            "topic": topic or "(no topic)",
+            "title": title,
+            "summary": our_summary,
+            "topic": topic,
         })
 
-    sessions.sort(key=lambda x: x["last_modified"], reverse=True)
+    # Add active sessions that don't have JSONL files (e.g. newly started/resumed)
+    seen_sids = {s["session_id"] for s in sessions}
+    for sid, info in active.items():
+        if sid not in seen_sids:
+            cwd = info.get("cwd", "~")
+            project = cwd.replace("/Users/jimmywei", "~") if cwd else "~"
+            sessions.append({
+                "session_id": sid,
+                "project": project,
+                "size_kb": 0,
+                "last_modified": datetime.datetime.now(),
+                "active": True,
+                "archived": False,
+                "pid": info.get("pid"),
+                "cwd": cwd,
+                "title": None,
+                "summary": summaries.get(sid),
+                "topic": "(new session)",
+            })
+
+    # Sort: alive first, then by last_modified desc
+    sessions.sort(key=lambda x: (not x["active"], -x["last_modified"].timestamp()))
     if limit:
         sessions = sessions[:limit]
     return sessions
 
 
+def derive_title(summary, topic=None, max_len=60):
+    """Derive a short title from a summary or topic string."""
+    text = summary or topic or ""
+    if not text:
+        return None
+    # Strip common noise prefixes
+    for prefix in ["No meaningful work", "No work was", "No prior work", "No session activity",
+                    "No significant work", "No code was", "No conversation", "Nothing was",
+                    "No completed session", "No actual task", "Attempted session summary but"]:
+        if text.startswith(prefix):
+            return "(empty session)"
+    # Take first sentence or up to max_len chars
+    for sep in [". ", " — ", "; ", " – "]:
+        idx = text.find(sep)
+        if 10 < idx <= max_len:
+            return text[:idx]
+    if len(text) <= max_len:
+        return text
+    # Truncate at word boundary
+    truncated = text[:max_len]
+    last_space = truncated.rfind(" ")
+    if last_space > max_len * 0.6:
+        truncated = truncated[:last_space]
+    return truncated + "…"
+
+
 def cmd_list(args):
     """List sessions."""
-    sessions = get_all_sessions(limit=args.limit, active_only=args.active)
+    include_archived = getattr(args, 'archived', False)
+    all_sessions = get_all_sessions(active_only=args.active, include_archived=include_archived)
+    total_count = len(all_sessions)
+    active_count = sum(1 for s in all_sessions if s["active"])
+    archived_count = len(load_archive()) if not include_archived else 0
+
+    # Pagination
+    limit = None if args.all else (args.limit or 25)
+    page = args.page or 1
+    if limit:
+        start = (page - 1) * limit
+        sessions = all_sessions[start:start + limit]
+        total_pages = (total_count + limit - 1) // limit
+    else:
+        sessions = all_sessions
+        total_pages = 1
 
     if args.json:
         for s in sessions:
@@ -139,22 +314,67 @@ def cmd_list(args):
         print(json.dumps(sessions, indent=2))
         return
 
-    active_count = sum(1 for s in sessions if s["active"])
-    total = len(get_all_sessions()) if not args.active else active_count
-    print(f"\n  Claude Code Sessions: {active_count} active / {total} total\n")
-    print(f"  {'STATUS':<10} {'PROJECT':<35} {'MODIFIED':<18} {'SIZE':>7}  TOPIC")
-    print(f"  {'─'*10} {'─'*35} {'─'*18} {'─'*7}  {'─'*50}")
+    verbose = args.verbose
 
+    showing = f"{len(sessions)}/{total_count}" if limit and total_count > limit else str(total_count)
+    page_info = f" (page {page}/{total_pages})" if total_pages > 1 else ""
+    archive_info = f", {archived_count} archived" if archived_count else ""
+    print(f"\n  Claude Code Sessions: {active_count} active / {total_count} total{archive_info} — showing {showing}{page_info}\n")
+
+    import textwrap
+    prev_active = None
     for s in sessions:
-        status = "\033[32m● ALIVE\033[0m" if s["active"] else "\033[90m○ dead\033[0m"
-        mod = s["last_modified"].strftime("%Y-%m-%d %H:%M")
-        size = f"{s['size_kb']}KB"
-        topic = s["topic"][:50]
-        proj = s["project"][:35]
-        print(f"  {status}  {proj:<35} {mod:<18} {size:>7}  {topic}")
+        # Separator between alive and dead sections
+        if prev_active is not None and prev_active and not s["active"]:
+            print(f"  {'─'*90}")
+        prev_active = s["active"]
 
-    print(f"\n  Resume: claude-sessions resume <SESSION_ID>")
-    print(f"  Start:  claude-sessions start <NAME> <DIR>\n")
+        status = "\033[32m●\033[0m" if s["active"] else "\033[90m○\033[0m"
+        sid = s["session_id"][:11]
+        mod = s["last_modified"].strftime("%m/%d %H:%M")
+        proj = s["project"][:25]
+
+        explicit_title = s.get("title")  # ai_title or custom_title from Claude
+        summary = s.get("summary")
+        topic = s.get("topic", "")
+        display_title = explicit_title or derive_title(summary, topic)
+
+        if verbose:
+            # Verbose: explicit title on header, full summary below (no truncation)
+            header = f"  {status} {sid}  {proj:<25} {mod}"
+            if explicit_title:
+                header += f"  \033[1m{explicit_title}\033[0m"
+            print(header)
+
+            if summary:
+                wrapped = textwrap.wrap(summary, width=88)
+                for line in wrapped:
+                    print(f"    \033[90m{line}\033[0m")
+            elif topic and topic != "(no topic)":
+                wrapped = textwrap.wrap(topic, width=88)
+                for line in wrapped:
+                    print(f"    \033[90m{line}\033[0m")
+            print()
+        else:
+            # Compact: single line with title
+            title_str = display_title or topic[:55] or ""
+            # Dim the title for inactive sessions
+            if s["active"]:
+                title_display = f"  {title_str}" if title_str else ""
+            else:
+                title_display = f"  \033[90m{title_str}\033[0m" if title_str else ""
+            print(f"  {status} {sid}  {proj:<25} {mod}{title_display}")
+
+    if not verbose:
+        print()  # single trailing newline in compact mode
+
+    # Footer
+    hints = ["Resume: claude-sessions resume <ID>"]
+    if total_pages > 1 and page < total_pages:
+        hints.insert(0, f"Next page: claude-sessions list -p {page + 1}")
+    if not verbose:
+        hints.append("Verbose: claude-sessions list -v")
+    print(f"  {' | '.join(hints)}\n")
 
 
 def cmd_ids(args):
@@ -163,23 +383,52 @@ def cmd_ids(args):
     for s in sessions:
         status = "ALIVE" if s["active"] else "dead"
         mod = s["last_modified"].strftime("%m/%d %H:%M")
-        print(f"{s['session_id']}  {status:<5}  {s['project']:<30}  {mod}  {s['topic'][:60]}")
+        display = s.get("title") or s.get("summary") or s.get("topic", "")
+        print(f"{s['session_id']}  {status:<5}  {s['project']:<30}  {mod}  {display[:60]}")
 
 
 def cmd_resume(args):
     """Resume a session by ID or partial match."""
     sessions = get_all_sessions()
-    match = find_session(sessions, args.session)
+
+    # Try exact match first
+    match = None
+    for s in sessions:
+        if s["session_id"] == args.session:
+            match = s
+            break
+
+    # Try partial ID match
+    if not match:
+        matches = [s for s in sessions if s["session_id"].startswith(args.session)]
+        if len(matches) == 1:
+            match = matches[0]
+        elif len(matches) > 1:
+            print(f"Ambiguous ID '{args.session}', matches:")
+            for m in matches:
+                print(f"  {m['session_id']}  {m['project']}  {m['topic'][:60]}")
+            sys.exit(1)
+
+    # Try project name match
+    if not match:
+        matches = [s for s in sessions if args.session.lower() in s["project"].lower()]
+        if len(matches) >= 1:
+            match = matches[0]  # Most recent
+
+    if not match:
+        print(f"No session found matching '{args.session}'")
+        sys.exit(1)
 
     if match["active"]:
         print(f"Session is already alive (PID {match['pid']})")
         print(f"Attach to it in tmux or run: claude --resume {match['session_id']}")
         sys.exit(0)
 
-    cwd = match.get("cwd") or HOME
+    cwd = match.get("cwd") or os.path.expanduser("~")
     cmd = ["claude", "--resume", match["session_id"]] + DEFAULT_FLAGS
 
     if args.background:
+        # Start in a new tmux window
         window_name = match["project"].split("/")[-1] or "claude"
         tmux_cmd = f"cd {cwd} && {' '.join(cmd)}"
         subprocess.run(["tmux", "new-window", "-n", window_name, tmux_cmd])
@@ -188,6 +437,8 @@ def cmd_resume(args):
         print(f"Resuming: {match['session_id']}")
         print(f"Project:  {match['project']}")
         print(f"Topic:    {match['topic'][:80]}")
+        print(f"Command:  {' '.join(cmd)}")
+        print()
         os.chdir(cwd)
         os.execvp("claude", cmd)
 
@@ -200,16 +451,20 @@ def cmd_start(args):
         sys.exit(1)
 
     cmd = ["claude"] + DEFAULT_FLAGS
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    output_file = os.path.join(RESULTS_DIR, f"{args.name}.txt")
+
+    # Output file for capturing results from -p mode
+    output_dir = os.path.expanduser("~/.claude/voice-results")
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f"{args.name}.txt")
 
     if args.prompt:
+        # Non-interactive: run with -p flag, capture output to file
         if args.background:
-            # Write prompt to temp file to avoid shell quoting issues
-            prompt_file = os.path.join(RESULTS_DIR, f"{args.name}.prompt")
+            # Write prompt to a temp file to avoid shell quoting issues
+            prompt_file = os.path.join(output_dir, f"{args.name}.prompt")
             with open(prompt_file, "w") as pf:
                 pf.write(args.prompt)
-            flags = " ".join(cmd[1:])
+            flags = " ".join(cmd[1:])  # skip 'claude' itself
             tmux_cmd = f'cd {cwd} && claude {flags} -p "$(cat {prompt_file})" 2>&1 | tee {output_file}'
             subprocess.run(["tmux", "new-window", "-n", args.name, "-d", tmux_cmd])
             print(f"Started in tmux window '{args.name}' (output: {output_file})")
@@ -245,14 +500,19 @@ def find_tty_for_pid(pid):
 def send_keystrokes_to_tty(tty_path, text):
     """Send keystrokes to a Terminal.app tab matching the given tty device.
 
-    Uses AppleScript to find the Terminal.app tab, bring it to front,
-    send keystrokes via System Events, then return focus.
+    Uses AppleScript to:
+    1. Find the Terminal.app tab with the matching tty
+    2. Bring it to front
+    3. Send keystrokes via System Events
+    4. Return focus to the original window
 
     Requires Accessibility permissions for Terminal.app.
     """
+    # Escape single quotes and backslashes for AppleScript
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
 
     script = f'''
+        -- Remember current frontmost app
         set origApp to name of (info for (path to frontmost application))
 
         tell application "Terminal"
@@ -283,6 +543,7 @@ def send_keystrokes_to_tty(tty_path, text):
             end tell
         end tell
 
+        -- Return focus to original app
         delay 0.2
         tell application origApp to activate
 
@@ -298,7 +559,7 @@ def send_keystrokes_to_tty(tty_path, text):
         error = result.stderr.strip()
         if "not allowed to send keystrokes" in error:
             print("Error: Accessibility permissions required.")
-            print("Grant access: System Preferences > Privacy & Security > Accessibility > Terminal.app")
+            print("Grant access: System Preferences → Privacy & Security → Accessibility → Terminal.app")
             sys.exit(1)
         raise RuntimeError(f"AppleScript failed: {error}")
 
@@ -342,19 +603,24 @@ def extract_assistant_text(line):
 def wait_for_response(jsonl_path, initial_size, timeout=120):
     """Watch a JSONL file using kqueue and return new assistant messages.
 
-    Uses macOS kqueue (via select.kqueue) for instant file change notification.
+    Uses macOS kqueue (via select.kqueue) to get instant notification when
+    the file is modified, instead of polling with sleep.
     """
-    fd = os.open(jsonl_path, os.O_RDONLY)
-    kq = select.kqueue()
+    import select as sel
 
-    ev = select.kevent(
+    fd = os.open(jsonl_path, os.O_RDONLY)
+    kq = sel.kqueue()
+
+    # Watch for writes to the file (NOTE_WRITE) and file extension (NOTE_EXTEND)
+    ev = sel.kevent(
         fd,
-        filter=select.KQ_FILTER_VNODE,
-        flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-        fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND,
+        filter=sel.KQ_FILTER_VNODE,
+        flags=sel.KQ_EV_ADD | sel.KQ_EV_CLEAR,
+        fflags=sel.KQ_NOTE_WRITE | sel.KQ_NOTE_EXTEND,
     )
     kq.control([ev], 0, 0)
 
+    # Seek to initial position
     f = open(jsonl_path, "r")
     f.seek(initial_size)
 
@@ -369,14 +635,17 @@ def wait_for_response(jsonl_path, initial_size, timeout=120):
             if remaining <= 0:
                 break
 
+            # Wait for file change event (instant notification, no polling)
             events = kq.control(None, 1, min(remaining, 2.0))
 
+            # Read any new lines
             new_lines = f.readlines()
             for line in new_lines:
                 line = line.strip()
                 if not line:
                     continue
 
+                # Check if our user message appeared
                 try:
                     data = json.loads(line)
                     msg = data.get("message", {})
@@ -385,12 +654,14 @@ def wait_for_response(jsonl_path, initial_size, timeout=120):
                 except Exception:
                     pass
 
+                # Collect assistant responses after user message
                 if saw_user_message:
                     text = extract_assistant_text(line)
                     if text:
                         assistant_responses.append(text)
                         last_response_time = time.time()
 
+            # If we've seen responses and there's been 3s of quiet, we're done
             if last_response_time and (time.time() - last_response_time) > 3.0:
                 break
 
@@ -402,36 +673,20 @@ def wait_for_response(jsonl_path, initial_size, timeout=120):
     return assistant_responses
 
 
-def find_session(sessions, query):
-    """Find a session by ID, partial ID, or project name."""
-    # Exact match
-    for s in sessions:
-        if s["session_id"] == query:
-            return s
-
-    # Partial ID match
-    matches = [s for s in sessions if s["session_id"].startswith(query)]
-    if len(matches) == 1:
-        return matches[0]
-    elif len(matches) > 1:
-        print(f"Ambiguous ID '{query}', matches:")
-        for m in matches:
-            print(f"  {m['session_id']}  {m['project']}  {m['topic'][:60]}")
-        sys.exit(1)
-
-    # Project name match
-    matches = [s for s in sessions if query.lower() in s["project"].lower()]
-    if len(matches) >= 1:
-        return matches[0]
-
-    print(f"No session found matching '{query}'")
-    sys.exit(1)
-
-
 def cmd_send(args):
     """Send a message to an active session via keystroke injection."""
     sessions = get_all_sessions(active_only=True)
-    match = find_session(sessions, args.session)
+
+    # Find matching session
+    match = None
+    for s in sessions:
+        if s["session_id"].startswith(args.session) or args.session.lower() in s["project"].lower():
+            match = s
+            break
+
+    if not match:
+        print(f"No active session matching '{args.session}'")
+        sys.exit(1)
 
     tty = find_tty_for_pid(match["pid"])
     if not tty:
@@ -440,6 +695,7 @@ def cmd_send(args):
 
     message = " ".join(args.message)
 
+    # Get JSONL file size before sending (for --wait)
     jsonl_path = find_session_jsonl(match["session_id"])
     initial_size = os.path.getsize(jsonl_path) if jsonl_path else 0
 
@@ -463,6 +719,7 @@ def cmd_send(args):
         else:
             print("No response received within timeout.")
 
+        # Return responses as JSON if requested
         if args.json:
             print(json.dumps({"responses": responses}))
 
@@ -470,9 +727,23 @@ def cmd_send(args):
 def cmd_read(args):
     """Read recent conversation from a session's JSONL file."""
     sessions = get_all_sessions()
-    match = find_session(sessions, args.session)
 
-    jsonl_path = find_session_jsonl(match["session_id"])
+    match = None
+    for s in sessions:
+        if s["session_id"].startswith(args.session) or args.session.lower() in s["project"].lower():
+            match = s
+            break
+
+    if not match:
+        print(f"No session matching '{args.session}'")
+        sys.exit(1)
+
+    # Find the JSONL file
+    jsonl_path = None
+    for jsonl in glob.glob(os.path.join(PROJECTS_DIR, "*", f"{match['session_id']}.jsonl")):
+        jsonl_path = jsonl
+        break
+
     if not jsonl_path:
         print(f"No conversation file found for {match['session_id']}")
         sys.exit(1)
@@ -481,7 +752,7 @@ def cmd_read(args):
     lines = open(jsonl_path).readlines()
 
     recent = []
-    for line in lines[-(n * 3):]:
+    for line in lines[-(n * 3):]:  # Read extra lines since not all are messages
         try:
             data = json.loads(line)
             msg = data.get("message", {})
@@ -516,12 +787,14 @@ def cmd_read(args):
 
 def cmd_result(args):
     """Read the output from a session started with -p flag."""
-    output_file = os.path.join(RESULTS_DIR, f"{args.session}.txt")
+    output_dir = os.path.expanduser("~/.claude/voice-results")
+    output_file = os.path.join(output_dir, f"{args.session}.txt")
 
     if not os.path.exists(output_file):
-        for f in os.listdir(RESULTS_DIR):
+        # Try partial match
+        for f in os.listdir(output_dir):
             if args.session.lower() in f.lower():
-                output_file = os.path.join(RESULTS_DIR, f)
+                output_file = os.path.join(output_dir, f)
                 break
         else:
             print(f"No output file for '{args.session}'")
@@ -534,17 +807,156 @@ def cmd_result(args):
         print(content)
 
 
+def cmd_fork(args):
+    """Fork a session — new session with the same conversation context."""
+    sessions = get_all_sessions()
+    match = find_session(sessions, args.session)
+
+    cwd = match.get("cwd") or HOME
+    cmd = ["claude", "--resume", match["session_id"], "--fork-session"] + DEFAULT_FLAGS
+
+    if args.prompt:
+        # Write prompt to temp file, fork will receive it as first message
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        prompt_file = os.path.join(RESULTS_DIR, "fork.prompt")
+        with open(prompt_file, "w") as pf:
+            pf.write(args.prompt)
+
+    if args.background:
+        window_name = f"{match['project'].split('/')[-1] or 'claude'}-fork"
+        if args.prompt:
+            tmux_cmd = f'cd {cwd} && {" ".join(cmd)} -p "$(cat {prompt_file})"'
+        else:
+            tmux_cmd = f"cd {cwd} && {' '.join(cmd)}"
+        subprocess.run(["tmux", "new-window", "-n", window_name, "-d", tmux_cmd])
+        print(f"Forked in tmux window '{window_name}'")
+    else:
+        print(f"Forking: {match['session_id']}")
+        print(f"Project: {match['project']}")
+        print(f"Context: {match['size_kb']}KB conversation history")
+        os.chdir(cwd)
+        os.execvp("claude", cmd)
+
+
 def cmd_kill(args):
     """Kill a session by ID or name."""
     sessions = get_all_sessions(active_only=True)
-    match = find_session(sessions, args.session)
+    match = None
+    for s in sessions:
+        if s["session_id"].startswith(args.session) or args.session.lower() in s["project"].lower():
+            match = s
+            break
+
+    if not match:
+        print(f"No active session matching '{args.session}'")
+        sys.exit(1)
 
     try:
-        os.kill(match["pid"], 15)
+        os.kill(match["pid"], 15)  # SIGTERM
         print(f"Killed PID {match['pid']} ({match['project']})")
         print(f"Resume later: claude-sessions resume {match['session_id']}")
     except Exception as e:
         print(f"Failed to kill: {e}")
+
+
+def cmd_summary(args):
+    """Set or view session summaries."""
+    summaries = load_summaries()
+    sessions = get_all_sessions()
+
+    if args.session is None:
+        # Show all summaries
+        print(f"\n  Session Summaries ({len(summaries)} saved):\n")
+        for s in sessions:
+            status = "\033[32m●\033[0m" if s["active"] else "\033[90m○\033[0m"
+            sid_short = s["session_id"][:12]
+            summary = s.get("summary") or "\033[90m(no summary)\033[0m"
+            proj = s["project"][:25]
+            mod = s["last_modified"].strftime("%m/%d")
+            print(f"  {status} {sid_short}  {proj:<25} {mod}  {summary}")
+        print()
+        return
+
+    # Find the session
+    match = None
+    for s in sessions:
+        if s["session_id"].startswith(args.session) or args.session.lower() in s["project"].lower():
+            match = s
+            break
+
+    if not match:
+        print(f"No session matching '{args.session}'")
+        sys.exit(1)
+
+    if args.text:
+        # Set summary
+        summaries[match["session_id"]] = " ".join(args.text)
+        save_summaries(summaries)
+        print(f"Summary saved for {match['session_id'][:12]} ({match['project']})")
+    else:
+        # Show summary for this session
+        summary = summaries.get(match["session_id"], "(no summary)")
+        print(f"Session: {match['session_id'][:12]}")
+        print(f"Project: {match['project']}")
+        print(f"Summary: {summary}")
+
+
+def cmd_archive(args):
+    """Archive or unarchive sessions."""
+    archive = load_archive()
+
+    if args.action == "list":
+        # Show archived sessions
+        all_sessions = get_all_sessions(include_archived=True)
+        archived_sessions = [s for s in all_sessions if s["archived"]]
+        if not archived_sessions:
+            print("No archived sessions.")
+            return
+        print(f"\n  Archived Sessions ({len(archived_sessions)}):\n")
+        for s in archived_sessions:
+            sid = s["session_id"][:11]
+            mod = s["last_modified"].strftime("%m/%d")
+            proj = s["project"][:25]
+            title = derive_title(s.get("summary"), s.get("topic"))
+            print(f"  \033[90m◌ {sid}  {proj:<25} {mod}  {title or ''}\033[0m")
+        print(f"\n  Unarchive: claude-sessions archive unarchive <ID>\n")
+        return
+
+    if args.action == "unarchive":
+        # Unarchive specific sessions
+        sessions = get_all_sessions(include_archived=True)
+        count = 0
+        for sid_prefix in args.sessions:
+            for s in sessions:
+                if s["session_id"].startswith(sid_prefix):
+                    archive.discard(s["session_id"])
+                    count += 1
+                    print(f"  Unarchived: {s['session_id'][:11]}  {s['project']}")
+                    break
+            else:
+                print(f"  Not found: {sid_prefix}")
+        save_archive(archive)
+        print(f"\n  {count} session(s) unarchived.")
+        return
+
+    # Default action: archive specific sessions
+    sessions = get_all_sessions(include_archived=True)
+    count = 0
+    for sid_prefix in args.sessions:
+        for s in sessions:
+            if s["session_id"].startswith(sid_prefix):
+                if s["active"]:
+                    print(f"  Skipped (active): {s['session_id'][:11]}  {s['project']}")
+                    continue
+                archive.add(s["session_id"])
+                count += 1
+                title = derive_title(s.get("summary"), s.get("topic"))
+                print(f"  Archived: {s['session_id'][:11]}  {title or s['project']}")
+                break
+        else:
+            print(f"  Not found: {sid_prefix}")
+    save_archive(archive)
+    print(f"\n  {count} session(s) archived.")
 
 
 def main():
@@ -554,7 +966,11 @@ def main():
     # list
     p_list = sub.add_parser("list", aliases=["ls"], help="List all sessions")
     p_list.add_argument("-a", "--active", action="store_true", help="Active only")
-    p_list.add_argument("-n", "--limit", type=int, default=25, help="Max results")
+    p_list.add_argument("-n", "--limit", type=int, default=25, help="Max results per page")
+    p_list.add_argument("-p", "--page", type=int, default=1, help="Page number")
+    p_list.add_argument("--all", action="store_true", help="Show all sessions (no pagination)")
+    p_list.add_argument("-v", "--verbose", action="store_true", help="Show full summaries")
+    p_list.add_argument("--archived", action="store_true", help="Include archived sessions")
     p_list.add_argument("--json", action="store_true", help="JSON output")
     p_list.set_defaults(func=cmd_list)
 
@@ -575,7 +991,7 @@ def main():
     p_start.add_argument("directory", help="Working directory")
     p_start.add_argument("-b", "--background", action="store_true", help="Start in tmux")
     p_start.add_argument("-p", "--prompt", type=str, default=None,
-                        help="Initial prompt (uses -p flag for non-interactive mode)")
+                        help="Initial prompt to send (uses -p flag for non-interactive)")
     p_start.set_defaults(func=cmd_start)
 
     # send
@@ -585,8 +1001,9 @@ def main():
     p_send.add_argument("-w", "--wait", action="store_true",
                         help="Wait for response using kqueue file watching")
     p_send.add_argument("-t", "--timeout", type=int, default=120,
-                        help="Max seconds to wait (default: 120)")
-    p_send.add_argument("--json", action="store_true", help="Output response as JSON")
+                        help="Max seconds to wait for response (default: 120)")
+    p_send.add_argument("--json", action="store_true",
+                        help="Output response as JSON")
     p_send.set_defaults(func=cmd_send)
 
     # read
@@ -600,15 +1017,45 @@ def main():
     p_result.add_argument("session", help="Session name")
     p_result.set_defaults(func=cmd_result)
 
+    # fork
+    p_fork = sub.add_parser("fork", help="Fork a session (new session with same context)")
+    p_fork.add_argument("session", help="Session ID, partial ID, or project name")
+    p_fork.add_argument("-b", "--background", action="store_true", help="Fork in tmux")
+    p_fork.add_argument("-p", "--prompt", type=str, default=None,
+                        help="Initial prompt for the forked session")
+    p_fork.set_defaults(func=cmd_fork)
+
     # kill
     p_kill = sub.add_parser("kill", help="Kill an active session")
     p_kill.add_argument("session", help="Session ID or project name")
     p_kill.set_defaults(func=cmd_kill)
 
+    # summary
+    p_summary = sub.add_parser("summary", aliases=["sum"], help="Set or view session summaries")
+    p_summary.add_argument("session", nargs="?", default=None,
+                           help="Session ID, partial ID, or project name (omit to list all)")
+    p_summary.add_argument("text", nargs="*", default=None,
+                           help="Summary text to set (omit to view)")
+    p_summary.set_defaults(func=cmd_summary)
+
+    # archive
+    p_archive = sub.add_parser("archive", help="Archive/unarchive sessions")
+    p_archive.add_argument("action", nargs="?", default="archive",
+                           choices=["archive", "list", "unarchive"],
+                           help="Action: archive (default), list, unarchive")
+    p_archive.add_argument("sessions", nargs="*", default=[],
+                           help="Session IDs to archive/unarchive")
+    p_archive.set_defaults(func=cmd_archive)
+
     args = parser.parse_args()
     if not args.command:
+        # Default to list
         args.active = False
         args.limit = 25
+        args.page = 1
+        args.all = False
+        args.verbose = False
+        args.archived = False
         args.json = False
         cmd_list(args)
     else:
