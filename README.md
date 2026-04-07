@@ -38,7 +38,7 @@ This whole thing was built in a single Claude Code session. The voice agent, the
 |---------|-------------|
 | "What sessions are running?" | Lists all active Claude Code sessions |
 | "What's the main session working on?" | Reads recent conversation from a session |
-| "Tell the forta session to check the build" | Injects a message into any running session |
+| "Tell the main session to check the build" | Injects a message into any running session |
 | "Start a new session in ~/projects/myapp" | Spins up a new background session |
 | "Kill the test session" | Stops a session |
 
