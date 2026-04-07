@@ -104,17 +104,19 @@ MIT — built by [@incidentfox](https://github.com/incidentfox)
 
 # :cn: 简体中文
 
-## CallClaude 是什么
+## 这是啥
 
-用电话控制你本地的 Claude Code 会话。真的，打个电话就行。
+打电话遥控你本地的 Claude Code。对，真的打电话。
 
-你在笔记本上跑着好几个 Claude Code 会话——一个在重构代码，一个在跑测试，一个在做研究。合上笔记本就完全失联了。CallClaude 给你一个电话号码，打过去就能查看所有会话状态、给任意会话发指令、读取会话历史、启动新会话。
+Mac上同时开五六个 Claude Code 终端，搞着搞着就不知道哪个在干嘛了。笔记本一合直接全部失联。所以搞了个电话号码，打过去就能语音操控所有 session。
 
-为什么是电话？因为我开特斯拉，不想折腾车载浏览器装什么 app。电话在任何车里都能用。
+为啥是电话？因为我开特斯拉，懒得折腾车载浏览器。电话在哪都能打，不香吗。
+
+整个项目是在一个 Claude Code session 里从零搭出来的。AI自己造了个遥控自己的工具。
 
 ## 安装
 
-打开 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)，粘贴以下内容：
+打开 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)，粘贴这段：
 
 ```
 Clone https://github.com/incidentfox/callclaude.git into ~/development/, read the CLAUDE.md, run setup.sh, then walk me through the full setup. I want to manage my Claude Code sessions from my phone by the end of this.
@@ -122,25 +124,24 @@ Clone https://github.com/incidentfox/callclaude.git into ~/development/, read th
 
 需要：macOS、[tmux](https://github.com/tmux/tmux)、[ngrok](https://ngrok.com/)、Node.js 18+、[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 
-## 工作原理
+## 咋实现的
 
 ```
-你的手机 → Retell AI (语音转文字 + LLM) → ngrok → 桥接服务器 → claude-sessions CLI → Terminal.app → Claude Code
+你的手机 → Retell AI (语音识别 + Claude Sonnet) → ngrok → 本地桥接服务器 → claude-sessions CLI → Terminal.app → Claude Code
 ```
 
-通过 [Retell AI](https://www.retellai.com/) 获取一个电话号码。打过去后，Retell 把你的语音转成文字，交给 Claude Sonnet 决定调用哪个工具，然后通过 ngrok 隧道访问你 Mac 上的桥接服务器。桥接服务器把工具调用转换成 `claude-sessions` CLI 命令——通过 AppleScript 按键注入找到对应的 Terminal.app 标签页，用 macOS kqueue 监听 JSONL 文件获取响应。
+Retell AI 把你说的话转成文字，Claude Sonnet 当大脑决定调哪个工具，通过 ngrok 隧道回到你 Mac 上的桥接服务器。服务器把工具调用转成 CLI 命令——用 AppleScript 找到对应终端标签页往里打字，用 kqueue 零轮询监听响应。
 
-一切都在本地运行。Retell 只能看到工具调用的名称和结果。
+全程本地跑。Retell 只看得到工具名称和结果，看不到你的代码。
 
 ## 功能
 
-- **语音控制** — 打电话就能操控你的会话
-- **跨会话通信** — 会话之间通过 AppleScript 按键注入互相通信
-- **会话管理** — 列出、启动、终止、恢复、分叉、归档会话
-- **编排器模式** — 一个主会话作为枢纽，连接 Telegram 和语音
-- **Telegram 集成** — 通过手机文字消息查看会话状态
-- **自动录音** — 每通电话自动录音并生成带时间戳的转写
+- **语音操控** — 打电话就能管session，堵车也能让AI干活
+- **跨session通信** — session之间通过 AppleScript 按键注入互发消息
+- **session管理** — 列出、启动、终止、恢复、分叉、归档
+- **编排器模式** — 一个主session当枢纽，连Telegram和语音
 - **电话白名单** — 只有你的号码能控制你的电脑
+- **自动录音** — 每通电话自动录音+带时间戳转写
 
 ## 许可证
 
